@@ -83,14 +83,37 @@ export function buildPaymentConfig(routes: RouteConfig[], payTo = WALLET_ADDRESS
         bazaar: {
           info: {
             input: {
-              type: "mcp",
-              toolName: route.toolName,
-              description: route.toolDescription,
-              inputSchema: route.inputSchema,
+              type: "http",
+              bodyType: "json",
+              body: {},
             },
             output: {
               type: "json",
+              example: {},
             },
+          },
+          schema: {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            type: "object",
+            properties: {
+              input: {
+                type: "object",
+                properties: {
+                  type: { type: "string", const: "http" },
+                  bodyType: { type: "string", enum: ["json"] },
+                  body: route.inputSchema,
+                },
+                required: ["body"],
+              },
+              output: {
+                type: "object",
+                properties: {
+                  type: { type: "string" },
+                  example: { type: "object" },
+                },
+              },
+            },
+            required: ["input", "output"],
           },
         },
       },
@@ -121,7 +144,13 @@ export function healthResponse(apiName: string) {
  * x402 Discovery — adds /.well-known/x402 endpoint for x402scan registration.
  * Also adds /openapi.json for OpenAPI-based discovery.
  */
+const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400"><defs><linearGradient id="bg1" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" style="stop-color:#0052FF"/><stop offset="100%" style="stop-color:#3B82F6"/></linearGradient></defs><rect width="400" height="400" rx="80" fill="url(#bg1)"/><text x="200" y="280" text-anchor="middle" font-family="Arial Black,sans-serif" font-size="220" font-weight="900" fill="white" letter-spacing="-10">777</text></svg>`;
+
 export function setupDiscovery(app: any, config: ApiConfig) {
+  // Favicon for x402scan
+  app.get("/favicon.svg", (c: any) => new Response(FAVICON_SVG, { headers: { "Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=86400" } }));
+  app.get("/favicon.ico", (c: any) => new Response(FAVICON_SVG, { headers: { "Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=86400" } }));
+
   // Register enrichment middleware for 402 responses (adds inputSchema to resource object)
   app.use("/api/*", x402scanEnrichMiddleware(config.routes));
 
@@ -165,11 +194,9 @@ export function setupDiscovery(app: any, config: ApiConfig) {
           ...(parameters && parameters.length > 0 ? { parameters } : {}),
           "x-payment-info": {
             price: {
-              fixed: {
-                mode: "fixed",
-                currency: "USD",
-                amount: route.price,
-              },
+              mode: "fixed",
+              currency: "USD",
+              amount: route.price.replace("$", ""),
             },
             protocols: [{ "x402": {} }],
           },
