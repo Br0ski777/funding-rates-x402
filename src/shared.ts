@@ -29,6 +29,21 @@ export function buildPaymentConfig(routes: RouteConfig[], payTo = WALLET_ADDRESS
       accepts: [{ scheme: "exact", price: route.price, network, payTo }],
       description: route.description,
       mimeType: route.mimeType ?? "application/json",
+      extensions: {
+        bazaar: {
+          info: {
+            input: {
+              type: "mcp",
+              toolName: route.toolName,
+              description: route.toolDescription,
+              inputSchema: route.inputSchema,
+            },
+            output: {
+              type: "json",
+            },
+          },
+        },
+      },
     };
   }
   return config;
