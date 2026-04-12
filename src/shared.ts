@@ -22,6 +22,56 @@ export interface ApiConfig {
   routes: RouteConfig[];
 }
 
+/**
+ * Middleware that enriches 402 responses with inputSchema in the resource object.
+ * x402scan requires resource.inputSchema for "invocable" endpoint registration.
+ * The x402 SDK doesn't include it by default, so we patch it post-hoc.
+ */
+export function x402scanEnrichMiddleware(routes: RouteConfig[]) {
+  // Build a lookup: "METHOD /path" -> inputSchema
+  const schemaMap = new Map<string, Record<string, unknown>>();
+  for (const route of routes) {
+    schemaMap.set(`${route.method} ${route.path}`, route.inputSchema);
+  }
+
+  return async (c: any, next: any) => {
+    await next();
+    if (c.res && c.res.status === 402) {
+      // Try both cases for the header name
+      const paymentHeader = c.res.headers.get("payment-required") || c.res.headers.get("PAYMENT-REQUIRED");
+      if (paymentHeader) {
+        try {
+          const decoded = JSON.parse(Buffer.from(paymentHeader, "base64").toString("utf-8"));
+          const reqPath = new URL(c.req.url).pathname;
+          const reqMethod = c.req.method;
+          const key = `${reqMethod} ${reqPath}`;
+          const schema = schemaMap.get(key);
+          if (schema && decoded.resource) {
+            decoded.resource.inputSchema = schema;
+            const enriched = Buffer.from(JSON.stringify(decoded)).toString("base64");
+            // Clone response with new header (Hono requires c.res replacement)
+            const clonedBody = await c.res.arrayBuffer();
+            const newRes = new Response(clonedBody, {
+              status: c.res.status,
+              statusText: c.res.statusText,
+            });
+            // Copy all headers
+            c.res.headers.forEach((v: string, k: string) => {
+              newRes.headers.set(k, v);
+            });
+            // Override payment-required with enriched version
+            newRes.headers.set("payment-required", enriched);
+            c.res = undefined as any;  // Force Hono to accept the new response
+            c.res = newRes;
+          }
+        } catch (e: any) {
+          console.error("[x402scan-enrich] Error:", e.message);
+        }
+      }
+    }
+  };
+}
+
 export function buildPaymentConfig(routes: RouteConfig[], payTo = WALLET_ADDRESS, network = DEFAULT_NETWORK) {
   const config: Record<string, unknown> = {};
   for (const route of routes) {
@@ -72,6 +122,9 @@ export function healthResponse(apiName: string) {
  * Also adds /openapi.json for OpenAPI-based discovery.
  */
 export function setupDiscovery(app: any, config: ApiConfig) {
+  // Register enrichment middleware for 402 responses (adds inputSchema to resource object)
+  app.use("/api/*", x402scanEnrichMiddleware(config.routes));
+
   // /.well-known/x402 discovery endpoint
   app.get("/.well-known/x402", (c: any) => {
     const origin = new URL(c.req.url).origin;
