@@ -32,6 +32,54 @@ Do NOT use for spot prices -- use dex_get_swap_quote instead. Do NOT use for yie
         },
         required: ["symbol"],
       },
+      outputSchema: {
+          "type": "object",
+          "properties": {
+            "symbol": {
+              "type": "string",
+              "description": "Trading pair symbol"
+            },
+            "pair": {
+              "type": "string",
+              "description": "Full pair name"
+            },
+            "found": {
+              "type": "boolean",
+              "description": "Whether rates were found"
+            },
+            "exchanges": {
+              "type": "number",
+              "description": "Number of exchanges with data"
+            },
+            "rates": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "exchange": {
+                    "type": "string"
+                  },
+                  "fundingRate": {
+                    "type": "number"
+                  },
+                  "annualized": {
+                    "type": "number"
+                  },
+                  "nextFunding": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "timestamp": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "symbol",
+            "found"
+          ]
+        },
     },
   ],
 };
