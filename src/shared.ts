@@ -245,6 +245,7 @@ export function setupDiscovery(app: any, config: ApiConfig) {
         schema: { type: prop.type, description: prop.description },
       })) : undefined;
       paths[route.path] = {
+        ...(paths[route.path] || {}),
         [method]: {
           summary: route.description,
           description: route.toolDescription,

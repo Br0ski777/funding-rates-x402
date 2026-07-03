@@ -146,9 +146,9 @@ async function fetchOKX(symbol: string): Promise<ExchangeRate | null> {
 }
 
 export function registerRoutes(app: Hono) {
-  app.get("/api/rates", async (c) => {
+  async function handleRates(c: any, params: { symbol?: string }) {
     await tryRequirePayment(0.002);
-    const symbol = c.req.query("symbol");
+    const symbol = params.symbol;
 
     if (!symbol) {
       return c.json({ error: "Missing required parameter: symbol (e.g. BTC, ETH, SOL)" }, 400);
@@ -232,6 +232,19 @@ export function registerRoutes(app: Hono) {
     cache.set(cacheKey, { data: response, timestamp: Date.now() });
 
     return c.json(response);
+  }
+
+  app.get("/api/rates", async (c) => {
+    return handleRates(c, { symbol: c.req.query("symbol") });
+  });
+
+  // POST mirror of the GET route above -- Bazaar (CDP) only reliably indexes
+  // POST payments with valid payloads (~82% conversion vs ~14% for GET-only
+  // resources, confirmed empirically). Same params, same logic, just body
+  // instead of query string.
+  app.post("/api/rates", async (c) => {
+    const body = await c.req.json().catch(() => ({}) as any);
+    return handleRates(c, { symbol: body.symbol });
   });
 }
 
