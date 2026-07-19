@@ -35,7 +35,8 @@ Any x402-aware client ([`@x402/fetch`](https://www.npmjs.com/package/@x402/fetch
 
 | Tool | Method | Path | Price | Description |
 |---|---|---|---|---|
-| `perp_get_funding_rates` | GET | `/api/rates` | $0.002 | Get perpetual futures funding rates across exchanges |
+| `perp_get_funding_rates` | GET | `/api/rates` | $0.005 | Get perpetual futures funding rates across exchanges |
+| `perp_get_funding_rates` | POST | `/api/rates` | $0.005 | Get perpetual futures funding rates across exchanges (POST variant) |
 
 ### `perp_get_funding_rates`
 
@@ -65,8 +66,37 @@ Example response:
 
 **Not for**: spot prices (use `dex_get_swap_quote`), yields (use `defi_find_best_yields`).
 
+### `perp_get_funding_rates`
+
+Use this when you need current perpetual futures funding rates for a single asset across exchanges. Returns rates comparison in JSON. POST variant of perp_get_funding_rates -- same params passed as JSON body instead of query string.
+
+**Parameters**
+
+| Name | Type | Required | Description |
+|---|---|---|---|
+| `symbol` | string | yes | Token symbol (e.g. BTC, ETH, SOL) |
+
+**Returns**
+
+- `symbol` -- trading pair symbol
+- `rates` -- array per exchange with exchange name, current funding rate, annualized rate
+- `openInterest` -- open interest in USD per exchange
+- `predictedNextRate` -- predicted next funding rate per exchange
+- `nextFundingTime` -- timestamp of next funding event
+
+Example response:
+
+```json
+{"symbol":"ETH","rates":[{"exchange":"Binance","rate":0.0082,"annualized":8.98},{"exchange":"Bybit","rate":0.0075,"annualized":8.21},{"exchange":"OKX","rate":0.0091,"annualized":9.97}],"openInterest":{"Binance":2150000000},"nextFundingTime":"2026-04-13T16:00:00Z"}
+```
+
+**When to use**: monitoring funding costs on your perpetual positions and timing entries. Essential for basis trading and funding cost management.
+
+**Not for**: spot prices (use `dex_get_swap_quote`), yields (use `defi_find_best_yields`).
+
 ## Example agent prompts
 
+- "Current perpetual futures funding rates for a single asset across exchanges"
 - "Current perpetual futures funding rates for a single asset across exchanges"
 
 ## Payment
