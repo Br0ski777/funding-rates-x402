@@ -9,7 +9,7 @@ export const API_CONFIG: ApiConfig = {
     {
       method: "GET",
       path: "/api/rates",
-      price: "$0.002",
+      price: "$0.005",
       description: "Get perpetual futures funding rates across exchanges",
       toolName: "perp_get_funding_rates",
       toolDescription: `Use this when you need current perpetual futures funding rates for a single asset across exchanges. Returns rates comparison in JSON.
@@ -84,7 +84,7 @@ Do NOT use for spot prices -- use dex_get_swap_quote instead. Do NOT use for yie
     {
       method: "POST",
       path: "/api/rates",
-      price: "$0.002",
+      price: "$0.005",
       description: "Get perpetual futures funding rates across exchanges (POST variant)",
       toolName: "perp_get_funding_rates",
       toolDescription: `Use this when you need current perpetual futures funding rates for a single asset across exchanges. Returns rates comparison in JSON. POST variant of perp_get_funding_rates -- same params passed as JSON body instead of query string.
