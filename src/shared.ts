@@ -258,7 +258,12 @@ export function setupDiscovery(app: any, config: ApiConfig) {
               currency: "USD",
               amount: route.price.replace("$", ""),
             },
-            protocols: [{ "x402": {} }],
+            // La sonde de découverte AgentCash/MPP lit cet openapi avant de
+            // sonder le runtime : sans `mpp` déclaré ici, l'inscription est
+            // refusée même quand le 402 porte bien son WWW-Authenticate.
+            protocols: process.env.MPP_ENABLED
+              ? [{ "x402": {} }, { "mpp": { method: "evm", intent: "charge", currency: "USDC" } }]
+              : [{ "x402": {} }],
           },
           responses: {
             "200": {

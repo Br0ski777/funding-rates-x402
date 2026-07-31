@@ -16,7 +16,9 @@
     "@x402/extensions": "^2.9.0",
     "@x402/hono": "^2.9.0",
     "bignumber.js": "^9.1.2",
-    "hono": "^4.7.0"
+    "hono": "^4.7.0",
+    "mppx": "^0.8.15",
+    "viem": "^2.55.10"
   },
   "devDependencies": {
     "bun-types": "latest",

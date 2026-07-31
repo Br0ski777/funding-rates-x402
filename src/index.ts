@@ -4,6 +4,7 @@ import { logger } from "hono/logger";
 import { healthResponse, buildPaymentConfig, setupMcp } from "./shared";
 import { API_CONFIG } from "./config";
 import { registerRoutes } from "./logic";
+import { setupMpp } from "./mpp";
 
 const app = new Hono();
 app.use("*", cors());
@@ -106,6 +107,11 @@ async function setupAtxp() {
 // ORDER MATTERS: ATXP middleware MUST be registered BEFORE x402 so it can
 // intercept ATXP/MPP/OAuth requests first. For non-ATXP requests it falls through.
 await setupAtxp();
+
+// MPP s'insère entre ATXP et x402 : il ne prend la main que sur un credential
+// `Authorization: Payment`, sinon il se contente d'annoncer le protocole sur le
+// 402 produit par x402.
+await setupMpp(app);
 
 await setupPayments();
 
