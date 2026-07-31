@@ -15,6 +15,10 @@ async function tryRequirePayment(price: number): Promise<void> {
   }
 }
 
+// Keep in sync with the route price in config.ts -- this is the ATXP channel,
+// the raw x402 gate reads config.ts directly.
+const PRICE_USD = 0.001;
+
 // In-memory cache with TTL
 interface CacheEntry {
   data: any;
@@ -28,6 +32,10 @@ const cache = new Map<string, CacheEntry>();
 // stalls the whole paid request (fetch has no default timeout).
 const UPSTREAM_TIMEOUT_MS = 2500;
 
+// The market-wide scan pulls ~850 markets per venue, so it gets a longer
+// budget than a single-symbol lookup.
+const SCAN_TIMEOUT_MS = 6000;
+
 // Hot-symbol prewarm: a symbol asked for recently is refreshed in the
 // background so the next paid call hits the cache instead of waiting on
 // three exchanges. Self-limiting -- with no traffic, nothing is refreshed.
@@ -36,13 +44,19 @@ const PREWARM_WINDOW_MS = 5 * 60 * 1000; // only symbols seen in the last 5 min
 const PREWARM_MAX_SYMBOLS = 5; // caps upstream load (~1.2 req/s worst case)
 const lastRequested = new Map<string, number>();
 
-function timeout(): AbortSignal {
-  return AbortSignal.timeout(UPSTREAM_TIMEOUT_MS);
+// Scan defaults. An agent hunting for an opportunity wants the top of the
+// book, not 850 rows -- but the cap is high enough to take the whole market.
+const SCAN_DEFAULT_LIMIT = 50;
+const SCAN_MAX_LIMIT = 1000;
+let scanRequestedAt = 0;
+
+function timeout(ms: number = UPSTREAM_TIMEOUT_MS): AbortSignal {
+  return AbortSignal.timeout(ms);
 }
 
-async function fetchJson(url: string): Promise<any | null> {
+async function fetchJson(url: string, ms?: number): Promise<any | null> {
   try {
-    const resp = await fetch(url, { signal: timeout() });
+    const resp = await fetch(url, { signal: timeout(ms) });
     if (!resp.ok) return null;
     return await resp.json();
   } catch {
@@ -155,6 +169,195 @@ async function fetchOKX(symbol: string): Promise<ExchangeRate | null> {
   };
 }
 
+// --- Market-wide scan -------------------------------------------------------
+// Binance and Bybit both return every perp in a single response, so the whole
+// market costs two upstream calls rather than one per symbol. OKX has no bulk
+// funding-rate endpoint (instId is mandatory), so it stays out of the scan and
+// is only used for single-symbol lookups.
+
+interface VenueQuote {
+  fundingRate: number;
+  annualizedRate: number;
+  markPrice: number | null;
+  openInterest: number | null;
+  nextFundingTime: string | null;
+}
+
+function baseSymbol(pair: string): string | null {
+  if (!pair.endsWith("USDT")) return null;
+  const base = pair.slice(0, -4);
+  return base.length > 0 ? base : null;
+}
+
+function annualize(rate: number): number {
+  // Funding settles every 8h on all three venues -> 3 periods per day.
+  return rate * 3 * 365 * 100;
+}
+
+async function fetchBinanceAll(): Promise<Map<string, VenueQuote>> {
+  const out = new Map<string, VenueQuote>();
+  const data = await fetchJson("https://fapi.binance.com/fapi/v1/premiumIndex", SCAN_TIMEOUT_MS);
+  if (!Array.isArray(data)) return out;
+
+  for (const row of data) {
+    const symbol = baseSymbol(row?.symbol || "");
+    if (!symbol) continue;
+    const rate = parseFloat(row.lastFundingRate ?? "0");
+    if (!Number.isFinite(rate)) continue;
+    const markPrice = parseFloat(row.markPrice ?? "0") || null;
+    out.set(symbol, {
+      fundingRate: rate,
+      annualizedRate: annualize(rate),
+      markPrice,
+      // premiumIndex carries no open interest; per-symbol OI would be one
+      // call per market, which defeats the point of a single-call scan.
+      openInterest: null,
+      nextFundingTime: row.nextFundingTime ? new Date(row.nextFundingTime).toISOString() : null,
+    });
+  }
+  return out;
+}
+
+async function fetchBybitAll(): Promise<Map<string, VenueQuote>> {
+  const out = new Map<string, VenueQuote>();
+  const data = await fetchJson("https://api.bybit.com/v5/market/tickers?category=linear", SCAN_TIMEOUT_MS);
+  const list = data?.result?.list;
+  if (!Array.isArray(list)) return out;
+
+  for (const row of list) {
+    const symbol = baseSymbol(row?.symbol || "");
+    if (!symbol) continue;
+    const rate = parseFloat(row.fundingRate ?? "");
+    if (!Number.isFinite(rate)) continue;
+    const markPrice = parseFloat(row.markPrice ?? "0") || null;
+    const oiContracts = parseFloat(row.openInterest ?? "0");
+    out.set(symbol, {
+      fundingRate: rate,
+      annualizedRate: annualize(rate),
+      markPrice,
+      openInterest: Number.isFinite(oiContracts) && markPrice ? oiContracts * markPrice : null,
+      nextFundingTime: row.nextFundingTime ? new Date(parseInt(row.nextFundingTime)).toISOString() : null,
+    });
+  }
+  return out;
+}
+
+// Builds the full unsorted market table and caches it. Sorting and limiting
+// are applied per request, so different sort orders share one upstream fetch.
+async function buildScan(): Promise<any[] | null> {
+  const [binance, bybit] = await Promise.all([fetchBinanceAll(), fetchBybitAll()]);
+  if (binance.size === 0 && bybit.size === 0) return null;
+
+  const symbols = new Set<string>([...binance.keys(), ...bybit.keys()]);
+  const markets: any[] = [];
+
+  for (const symbol of symbols) {
+    const venues: Record<string, VenueQuote> = {};
+    const b = binance.get(symbol);
+    const y = bybit.get(symbol);
+    if (b) venues.Binance = b;
+    if (y) venues.Bybit = y;
+
+    const quotes = Object.entries(venues);
+    if (quotes.length === 0) continue;
+
+    const rates = quotes.map(([, q]) => q.fundingRate);
+    const avgRate = rates.reduce((a, c) => a + c, 0) / rates.length;
+
+    let spread: number | null = null;
+    let longVenue: string | null = null;
+    let shortVenue: string | null = null;
+    if (quotes.length > 1) {
+      const sorted = [...quotes].sort((a, c) => a[1].fundingRate - c[1].fundingRate);
+      // Long where funding is cheapest, short where it pays the most.
+      longVenue = sorted[0][0];
+      shortVenue = sorted[sorted.length - 1][0];
+      spread = sorted[sorted.length - 1][1].fundingRate - sorted[0][1].fundingRate;
+    }
+
+    const markPrices = quotes.map(([, q]) => q.markPrice).filter((p): p is number => !!p);
+    const ois = quotes.map(([, q]) => q.openInterest).filter((o): o is number => !!o);
+
+    markets.push({
+      symbol,
+      venueCount: quotes.length,
+      venues: Object.fromEntries(
+        quotes.map(([name, q]) => [
+          name,
+          {
+            fundingRate: q.fundingRate,
+            fundingRatePercent: (q.fundingRate * 100).toFixed(4) + "%",
+            annualizedRate: Number(q.annualizedRate.toFixed(2)),
+            nextFundingTime: q.nextFundingTime,
+          },
+        ]),
+      ),
+      avgRate,
+      avgRatePercent: (avgRate * 100).toFixed(4) + "%",
+      annualizedRate: Number(annualize(avgRate).toFixed(2)),
+      direction: avgRate >= 0 ? "short opportunity (longs pay shorts)" : "long opportunity (shorts pay longs)",
+      spread,
+      spreadPercent: spread === null ? null : (spread * 100).toFixed(4) + "%",
+      spreadAnnualized: spread === null ? null : Number(annualize(spread).toFixed(2)),
+      longVenue,
+      shortVenue,
+      markPrice: markPrices.length ? markPrices.reduce((a, c) => a + c, 0) / markPrices.length : null,
+      openInterest: ois.length ? ois.reduce((a, c) => a + c, 0) : null,
+    });
+  }
+
+  cache.set("scan:all", { data: markets, timestamp: Date.now() });
+  return markets;
+}
+
+function sortMarkets(markets: any[], sort: string): any[] {
+  const rows = [...markets];
+  switch (sort) {
+    case "highest":
+      return rows.sort((a, b) => b.avgRate - a.avgRate);
+    case "lowest":
+      return rows.sort((a, b) => a.avgRate - b.avgRate);
+    case "spread":
+      return rows.sort((a, b) => Math.abs(b.spread ?? 0) - Math.abs(a.spread ?? 0));
+    case "abs":
+    default:
+      return rows.sort((a, b) => Math.abs(b.avgRate) - Math.abs(a.avgRate));
+  }
+}
+
+// Keeps recently requested symbols warm so paid calls skip the upstream leg.
+let prewarmStarted = false;
+function startPrewarm() {
+  if (prewarmStarted) return;
+  prewarmStarted = true;
+
+  setInterval(() => {
+    const now = Date.now();
+    const hot: string[] = [];
+
+    for (const [symbol, seen] of lastRequested) {
+      if (now - seen > PREWARM_WINDOW_MS) {
+        lastRequested.delete(symbol);
+      } else {
+        hot.push(symbol);
+      }
+    }
+
+    // Most recently requested first, so the busiest symbols stay warm.
+    hot.sort((a, b) => (lastRequested.get(b) || 0) - (lastRequested.get(a) || 0));
+
+    for (const symbol of hot.slice(0, PREWARM_MAX_SYMBOLS)) {
+      buildRates(symbol).catch(() => {});
+    }
+
+    // Same idea for the scan: only refreshed while somebody is actually asking
+    // for it, so an idle container issues no upstream traffic at all.
+    if (now - scanRequestedAt < PREWARM_WINDOW_MS) {
+      buildScan().catch(() => {});
+    }
+  }, PREWARM_INTERVAL_MS).unref?.();
+}
+
 // Builds the payload for a symbol and stores it in the cache.
 // Returns null when no exchange had data for that symbol.
 async function buildRates(symbolUpper: string): Promise<any | null> {
@@ -214,42 +417,64 @@ async function buildRates(symbolUpper: string): Promise<any | null> {
   return response;
 }
 
-// Keeps recently requested symbols warm so paid calls skip the upstream leg.
-let prewarmStarted = false;
-function startPrewarm() {
-  if (prewarmStarted) return;
-  prewarmStarted = true;
-
-  setInterval(() => {
-    const now = Date.now();
-    const hot: string[] = [];
-
-    for (const [symbol, seen] of lastRequested) {
-      if (now - seen > PREWARM_WINDOW_MS) {
-        lastRequested.delete(symbol);
-      } else {
-        hot.push(symbol);
-      }
-    }
-
-    // Most recently requested first, so the busiest symbols stay warm.
-    hot.sort((a, b) => (lastRequested.get(b) || 0) - (lastRequested.get(a) || 0));
-
-    for (const symbol of hot.slice(0, PREWARM_MAX_SYMBOLS)) {
-      buildRates(symbol).catch(() => {});
-    }
-  }, PREWARM_INTERVAL_MS).unref?.();
-}
-
 export function registerRoutes(app: Hono) {
   startPrewarm();
 
-  async function handleRates(c: any, params: { symbol?: string }) {
-    await tryRequirePayment(0.005);
+  async function handleScan(c: any, params: { sort?: string; limit?: any; minVenues?: any }) {
+    scanRequestedAt = Date.now();
+
+    const sort = ["abs", "highest", "lowest", "spread"].includes(String(params.sort))
+      ? String(params.sort)
+      : "abs";
+
+    const rawLimit = parseInt(String(params.limit ?? ""), 10);
+    const limit = Number.isFinite(rawLimit)
+      ? Math.min(Math.max(rawLimit, 1), SCAN_MAX_LIMIT)
+      : SCAN_DEFAULT_LIMIT;
+
+    const rawMinVenues = parseInt(String(params.minVenues ?? ""), 10);
+    const minVenues = Number.isFinite(rawMinVenues) ? Math.min(Math.max(rawMinVenues, 1), 2) : 1;
+
+    const cached = cache.get("scan:all");
+    let markets: any[] | null;
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+      markets = cached.data;
+    } else {
+      markets = await buildScan();
+    }
+
+    if (!markets) {
+      return c.json(
+        { scan: true, found: false, message: "No exchange returned funding data. Upstreams may be rate limiting." },
+        503,
+      );
+    }
+
+    const filtered = markets.filter((m) => m.venueCount >= minVenues);
+
+    return c.json({
+      scan: true,
+      found: true,
+      totalMarkets: filtered.length,
+      venues: ["Binance", "Bybit"],
+      sort,
+      limit,
+      minVenues,
+      note: "Market-wide scans cover Binance and Bybit. OKX has no bulk funding-rate endpoint, so it is only included when you query a single symbol.",
+      markets: sortMarkets(filtered, sort).slice(0, limit),
+      timestamp: new Date().toISOString(),
+      cachedUntil: new Date(Date.now() + CACHE_TTL).toISOString(),
+    });
+  }
+
+  async function handleRates(c: any, params: { symbol?: string; sort?: string; limit?: any; minVenues?: any }) {
+    await tryRequirePayment(PRICE_USD);
     const symbol = params.symbol;
 
+    // No symbol means "show me the whole market". An agent hunting for a
+    // funding opportunity should not have to pay per symbol to find one.
     if (!symbol) {
-      return c.json({ error: "Missing required parameter: symbol (e.g. BTC, ETH, SOL)" }, 400);
+      return handleScan(c, params);
     }
 
     const symbolUpper = symbol.toUpperCase();
@@ -278,7 +503,12 @@ export function registerRoutes(app: Hono) {
   }
 
   app.get("/api/rates", async (c) => {
-    return handleRates(c, { symbol: c.req.query("symbol") });
+    return handleRates(c, {
+      symbol: c.req.query("symbol"),
+      sort: c.req.query("sort"),
+      limit: c.req.query("limit"),
+      minVenues: c.req.query("minVenues"),
+    });
   });
 
   // POST mirror of the GET route above -- Bazaar (CDP) only reliably indexes
@@ -287,7 +517,12 @@ export function registerRoutes(app: Hono) {
   // instead of query string.
   app.post("/api/rates", async (c) => {
     const body = await c.req.json().catch(() => ({}) as any);
-    return handleRates(c, { symbol: body.symbol });
+    return handleRates(c, {
+      symbol: body.symbol,
+      sort: body.sort,
+      limit: body.limit,
+      minVenues: body.minVenues,
+    });
   });
 }
 
